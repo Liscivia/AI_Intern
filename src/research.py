@@ -154,24 +154,87 @@ def _notion_block_to_markdown(block: Dict[str, Any]) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Additional helper – detect whether a DDQ child page has been marked as
+# completed.  We mirror the logic used in ``watcher.py`` so that both modules
+# are consistent when determining which questionnaire is finished.
+# ---------------------------------------------------------------------------
+
+def _ddq_is_completed(client: NotionClient, ddq_block_id: str) -> bool:
+    """Return ``True`` if the given DDQ child-page contains a completion mark.
+
+    The heuristic replicates the one implemented in ``watcher.py``:
+
+    1.  Scan blocks bottom-up looking for a *to-do* block – if the checkbox
+        is ticked the questionnaire is considered complete.
+    2.  Fallback: inspect paragraph/bullet/numbered-list items for literal
+        "[x]" or "[ ]" markers (case-insensitive) which are occasionally used
+        as markdown-style checkboxes inside Notion.
+    """
+
+    # Fetch **all** blocks under the questionnaire page (pagination handled)
+    blocks = _list_blocks(client, ddq_block_id)
+
+    # Walk blocks in reverse order so we reach the completion marker sooner.
+    for blk in reversed(blocks):
+        b_type: str = blk.get("type", "")
+
+        if b_type == "to_do":
+            return bool(blk["to_do"].get("checked", False))
+
+        # Fallback – look for markdown-style checkboxes embedded in text
+        for kind in ("paragraph", "bulleted_list_item", "numbered_list_item"):
+            if b_type == kind:
+                rich = blk[kind].get("rich_text", [])
+                text = "".join(part.get("plain_text", "") for part in rich).lower()
+                if "[x]" in text:
+                    return True
+                if "[ ]" in text:
+                    return False
+
+    # No explicit marker found → assume not completed
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Modified DDQ fetcher – pick the *completed* questionnaire if multiple exist
+# ---------------------------------------------------------------------------
+
 def _fetch_ddq_markdown(page_id: str) -> str:
-    """Fetch the DDQ sub-page for the given *page_id* and return Markdown."""
+    """Return Markdown for the *completed* DDQ questionnaire under *page_id*.
+
+    If multiple "Due Diligence …" child-pages exist we locate the one that
+    carries a completion mark (✅).  This guarantees that the deep-research
+    pipeline analyses the most relevant questionnaire and ignores drafts or
+    external templates still in progress.
+    """
 
     client = _build_notion_client()
 
-    # First list children of the main page and find the DDQ sub-page
+    # Gather **all** child pages whose title begins with "Due Diligence" – the
+    # card may contain separate internal/external questionnaires.
     blocks = _list_blocks(client, page_id)
-    ddq_block = next(
-        (
-            b
-            for b in blocks
-            if b.get("type") == "child_page"
-            and b["child_page"]["title"].lower().startswith("due diligence")
-        ),
-        None,
-    )
-    if not ddq_block:
-        raise RuntimeError(f"Page {page_id} does not contain a Due Diligence sub-page.")
+    ddq_candidates: List[Dict[str, Any]] = [
+        b
+        for b in blocks
+        if b.get("type") == "child_page"
+        and b["child_page"]["title"].lower().startswith("due diligence")
+    ]
+
+    # Prefer the first questionnaire that is marked as completed.
+    ddq_block: Dict[str, Any] | None = None
+    for cand in ddq_candidates:
+        cand_id = cast(str, cand["id"])
+        if _ddq_is_completed(client, cand_id):
+            ddq_block = cand
+            break
+
+    if ddq_block is None:
+        titles = ", ".join(b["child_page"]["title"] for b in ddq_candidates) or "<none>"
+        raise RuntimeError(
+            f"No completed Due Diligence questionnaire found for page {page_id}. "
+            f"Candidates inspected: {titles}"
+        )
 
     ddq_id = cast(str, ddq_block["id"])
     ddq_blocks = _list_blocks(client, ddq_id)
@@ -185,24 +248,89 @@ def _fetch_ddq_markdown(page_id: str) -> str:
     return "\n".join(markdown_lines)
 
 
+def _fetch_calls_text(page_id: str) -> str:
+    """Return Markdown-like text contained in the *Call Notes* child-page.
+
+    If the card does not include a *Call Notes* child-page, an empty string
+    is returned.  The function does *not* raise because call notes are
+    considered optional context.
+    """
+
+    client = _build_notion_client()
+
+    # Locate child-pages named *Call Notes* (case-insensitive, allow prefix)
+    top_blocks = _list_blocks(client, page_id)
+    call_note_pages: List[Dict[str, Any]] = [
+        b
+        for b in top_blocks
+        if b.get("type") == "child_page"
+        and b["child_page"]["title"].lower().startswith("call notes")
+    ]
+
+    if not call_note_pages:
+        return ""  # nothing found – optional context
+
+    page = call_note_pages[0]  # take the first match
+    call_id = cast(str, page["id"])
+    blocks = _list_blocks(client, call_id)
+
+    lines: List[str] = []
+    for blk in blocks:
+        text = _notion_block_to_markdown(blk).rstrip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _fetch_freeform_text(page_id: str) -> str:
+    """Return Markdown-like text from the *main card body* (non-child blocks)."""
+
+    client = _build_notion_client()
+    blocks = _list_blocks(client, page_id)
+
+    lines: List[str] = []
+    for blk in blocks:
+        # Skip child-pages (DDQs, Call Notes, Ratings, etc.) – we only want
+        # the free-form content directly written on the card itself.
+        if blk.get("type") == "child_page":
+            continue
+
+        text = _notion_block_to_markdown(blk).rstrip()
+        if text:
+            lines.append(text)
+
+    return "\n".join(lines)
+
+
+# Research configuration from environment variables
+BREADTH = int(os.getenv("RESEARCH_BREADTH",1))
+DEPTH = int(os.getenv("RESEARCH_DEPTH",1))
+CONCURRENCY = int(os.getenv("RESEARCH_CONCURRENCY",1))
+
 async def _deep_research_runner(
     page_id: str,
     ddq_md_path: Path,
     *,
-    breadth: int = 4,
-    depth: int = 2,
-    concurrency: int = 2,
+    breadth: int = BREADTH,
+    depth: int = DEPTH,
+    concurrency: int = CONCURRENCY,
 ) -> Path:
     """Internal async helper that orchestrates the deep-research run."""
 
     _logger.info("action=run.start page_id=%s", page_id)
 
     # ------------------------------------------------------------------
-    # 1. Fetch DDQ markdown (and write it to disk for traceability)
+    # 1. Fetch core Notion content (DDQ + supplementary context) and persist
+    #    the DDQ to disk for traceability.
     # ------------------------------------------------------------------
-    ddq_markdown = _fetch_ddq_markdown(page_id)
-    ddq_md_path.write_text(ddq_markdown, encoding="utf-8")
-    _logger.info("action=ddq.fetched bytes=%d", len(ddq_markdown))
+    ddq_text = _fetch_ddq_markdown(page_id)
+    calls_text = _fetch_calls_text(page_id)
+    freeform_text = _fetch_freeform_text(page_id)
+
+    # Preserve the DDQ text exactly as before for audit/debug purposes
+    ddq_md_path.write_text(ddq_text, encoding="utf-8")
+    _logger.info("action=content.fetched ddq_bytes=%d calls_bytes=%d freeform_bytes=%d",
+                len(ddq_text), len(calls_text), len(freeform_text))
 
     # ------------------------------------------------------------------
     # 2. Kick-off deep research
@@ -210,22 +338,14 @@ async def _deep_research_runner(
     client = AIClientFactory.get_client("openai")
     model = AIClientFactory.get_model("openai")
 
-    # You probably already fetched ddq_markdown earlier
-    research_query = f"""
-Project Due Diligence Questionnaire for analysis
-================================================
-
-Act as a senior blockchain fund analyst. Read the questionnaire below, then
-perform deep web-research to produce an institutional level report 
-on the given project to help guide investment decision by Impossible Finance.
-Your output will be covering: product, technology, traction, team, tokenomics & 
-token vlue accrual, revenue model & P/E, competitive landscape, key risks, valuation, 
-and a final recommend / pass.
-
-<ddq_markdown>
-{(ddq_markdown)}
-</ddq_markdown>
-""".strip()
+    # Build the prompt that will be fed into the deep-research agent.
+    header = os.getenv("DEEP_RESEARCH_PROMPT")
+    research_query = (
+        f"{header}\n\n"
+        f"<freeform_text>\n{freeform_text}\n</freeform_text>\n\n"
+        f"<calls_text>\n{calls_text}\n</calls_text>\n\n"
+        f"<ddq_text>\n{ddq_text}\n</ddq_text>"
+    )
 
     results = await _deep_research(
         query=research_query,
@@ -254,7 +374,7 @@ and a final recommend / pass.
     # 3. Compose final report
     # ------------------------------------------------------------------
     report_md = await _write_final_report(
-        prompt=ddq_markdown,
+        prompt=ddq_text,
         learnings=learnings,
         visited_urls=visited_urls,
         client=client,
@@ -265,8 +385,18 @@ and a final recommend / pass.
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"report_{page_id}.md"
     report_path.write_text(report_md, encoding="utf-8")
-
     _logger.info("action=report.saved path=%s bytes=%d", report_path, len(report_md))
+
+    # ------------------------------------------------------------------
+    # DEBUG: persist the exact prompt used for the LLM to the reports dir
+    # so analysts can easily inspect what went into the model.
+    # ------------------------------------------------------------------
+    try:
+        prompt_path = reports_dir / f"prompt_{page_id}.txt"
+        prompt_path.write_text(research_query, encoding="utf-8")
+        _logger.info("action=prompt.saved path=%s bytes=%d", prompt_path, len(research_query))
+    except Exception as e:  # pragma: no cover – best-effort debug output
+        _logger.warning("action=prompt.save_failed error=%s", e)
 
     # ------------------------------------------------------------------
     # 4. Clean-up scraping resources (e.g. Playwright) to avoid warnings

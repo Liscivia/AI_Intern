@@ -27,7 +27,7 @@ raised to the caller so that the orchestrator can decide whether to abort or
 escalate.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 import os
 import pathlib
@@ -134,29 +134,72 @@ def _is_retryable(exc: Exception) -> bool:  # pragma: no cover – trivial predi
 
 
 def _query_database(client: Client, payload: Dict[str, object]) -> Dict[str, object]:
-    """Fire the ``databases.query`` call with retry/back-off.
+    """Query a Notion database and *return **all** matching pages*.
 
-    This is extracted so that the tenacity logic lives in one place and can
-    be easily unit-tested by monkey-patching the underlying SDK method.
+    The Notion API returns results in pages of at most 100 items.  The
+    original implementation surfaced only the first page which meant callers
+    could silently miss older cards once the project list grew beyond 100.
+
+    We now follow the ``next_cursor`` pointer until ``has_more`` is ``False``
+    so that the caller always receives a complete view.  The helper still
+    preserves the original response structure (dict with a ``results`` key)
+    but aggregates the items across all pages.  ``has_more`` is forced to
+    ``False`` to make it explicit that pagination has been resolved.
     """
 
-    retry = Retrying(
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=2),
-        stop=stop_after_attempt(3),
-        retry=retry_if_exception(_is_retryable),
-        reraise=True,
-    )
+    all_results: List[Dict[str, object]] = []
+    next_cursor: str | None = None
+    first_resp: Dict[str, object] | None = None
 
-    # tenacity.Retrying is an iterator – we need to wrap the call.
-    for attempt in retry:
-        with attempt:
-            return cast(
-                Dict[str, object],
-                client.databases.query(**payload),  # type: ignore[arg-type]
-            )
+    while True:
+        call_kwargs = payload.copy()
+        if next_cursor is not None:
+            call_kwargs["start_cursor"] = next_cursor
 
-    # Should be unreachable due to reraise=True.
-    raise RuntimeError("Retry logic exited unexpectedly without a result.")
+        # --------------------------------------------------------------
+        # Fire the API request with Tenacity retry/back-off
+        # --------------------------------------------------------------
+        retry = Retrying(
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2),
+            stop=stop_after_attempt(3),
+            retry=retry_if_exception(_is_retryable),
+            reraise=True,
+        )
+
+        resp: Dict[str, object] | None = None
+        for attempt in retry:
+            with attempt:
+                resp = cast(
+                    Dict[str, object],
+                    client.databases.query(**call_kwargs),  # type: ignore[arg-type]
+                )
+
+        if resp is None:  # pragma: no cover – defensive guard
+            raise RuntimeError("Notion API call unexpectedly returned None.")
+
+        # Save the first page so we can reuse its metadata when we return
+        if first_resp is None:
+            first_resp = resp
+
+        all_results.extend(cast(List[Dict[str, object]], resp.get("results", [])))
+
+        if not resp.get("has_more", False):
+            break
+
+        next_cursor = cast(str, resp.get("next_cursor"))
+        if next_cursor is None:  # Safety net – should not happen per API docs
+            break
+
+    # ------------------------------------------------------------------
+    # Build the aggregated response – replicate the first page's structure
+    # but replace results / pagination flags so callers remain compatible.
+    # ------------------------------------------------------------------
+    aggregated: Dict[str, object] = first_resp.copy() if first_resp else {}
+    aggregated["results"] = all_results
+    aggregated["has_more"] = False
+    aggregated["next_cursor"] = None
+
+    return aggregated
 
 
 def _list_blocks(client: Client, block_id: str) -> List[Dict[str, object]]:
@@ -198,16 +241,121 @@ def _list_blocks(client: Client, block_id: str) -> List[Dict[str, object]]:
     return blocks
 
 
+def _ddq_is_completed(client: Client, ddq_block_id: str) -> bool:
+    """Return True if the DDQ child-page contains a completion mark (✅).
+
+    The heuristic mirrors *research.py* so that both modules stay aligned:
+
+    1. Walk blocks bottom-up and look for a *to-do* block – if it's checked
+       the questionnaire is considered finished.
+    2. Fallback: inspect paragraph/bullet/numbered-list blocks for literal
+       "[x]" or "[ ]" markers that are sometimes used as markdown-style
+       checkboxes inside Notion.
+    """
+
+    blocks = _list_blocks(client, ddq_block_id)
+
+    for blk in reversed(blocks):
+        b_type: str = blk.get("type", "")
+
+        if b_type == "to_do":
+            return bool(blk["to_do"].get("checked", False))
+
+        # Fallback – look for markdown-style checkboxes inside rich text
+        for kind in ("paragraph", "bulleted_list_item", "numbered_list_item"):
+            if b_type == kind:
+                rich = blk[kind].get("rich_text", [])
+                text = "".join(part.get("plain_text", "") for part in rich).lower()
+                if "[x]" in text:
+                    return True
+                if "[ ]" in text:
+                    return False
+
+    return False
+
+
+def _page_last_edited_time(client: Client, page_id: str) -> datetime | None:
+    """Return ``last_edited_time`` for a Notion *page* (UTC-aware).
+
+    We need to call `pages.retrieve` because the *child_page* block under the
+    parent card **does not update** its own `last_edited_time` when content
+    *inside* the page changes (which is what usually happens when the ✅ box
+    is ticked).  Relying on the block-level timestamp therefore causes us to
+    miss recently-edited questionnaires.
+    """
+
+    retry = Retrying(
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=2),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+
+    resp: Dict[str, object] | None = None
+    for attempt in retry:
+        with attempt:
+            resp = cast(Dict[str, object], client.pages.retrieve(page_id=page_id))  # type: ignore[arg-type]
+
+    if resp is None:
+        return None
+
+    ts: str | None = cast(str | None, resp.get("last_edited_time"))
+    if ts is None:
+        return None
+
+    if ts.endswith("Z"):
+        page_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    else:
+        page_dt = datetime.fromisoformat(ts)
+
+    # ------------------------------------------------------------------
+    # Fallback v2 – inspect *top-level* child blocks
+    # ------------------------------------------------------------------
+    # Some workspaces never update the page-level metadata even when
+    # blocks inside the page change.  As a secondary heuristic we scan the
+    # timestamps of the immediate child blocks and take the most recent
+    # one.  We purposefully avoid a deep recursive crawl to keep the number
+    # of API requests bounded – in the vast majority of questionnaires the
+    # final ✅ checkbox that matters lives at the first level anyway.
+    # ------------------------------------------------------------------
+    try:
+        blocks = _list_blocks(client, page_id)
+    except Exception as exc:  # pragma: no cover – defensive guard
+        _logger.warning("action=page.ts_blocks.error page_id=%s err=%s", page_id, exc)
+        return page_dt  # Fall back to the original page timestamp
+
+    latest_block_dt: datetime | None = None
+    for blk in blocks:
+        blk_ts_raw: str | None = blk.get("last_edited_time")  # noqa: E501 – long attr name
+        if blk_ts_raw is None:
+            continue
+
+        blk_dt: datetime
+        if blk_ts_raw.endswith("Z"):
+            blk_dt = datetime.fromisoformat(blk_ts_raw.replace("Z", "+00:00"))
+        else:
+            blk_dt = datetime.fromisoformat(blk_ts_raw)
+
+        if latest_block_dt is None or blk_dt > latest_block_dt:
+            latest_block_dt = blk_dt
+
+    # Return whichever timestamp is newer – the page itself or its blocks.
+    if latest_block_dt and latest_block_dt > page_dt:
+        return latest_block_dt
+
+    return page_dt
+
+
 def poll_notion_db(
     *,
-    since: datetime | None = None,
-    created_after: datetime | None = None,
+    last_updated: datetime | None = None,
+    created_after: datetime | int | float | timedelta | None = None,
 ) -> List[Dict[str, str]]:
     """Return pages whose **Completed** checkbox is set to ✅.
 
     Parameters
     ----------
-    since
+    last_updated
         If provided, include only pages whose ``last_edited_time`` is *after*
         this timestamp.
     created_after
@@ -223,40 +371,62 @@ def poll_notion_db(
     Notes
     -----
     The utility is stateless – callers should track the timestamp of the last
-    successful poll and pass it via *since*.
+    successful poll and pass it via *last_updated*.
     """
 
     db_id = os.getenv("NOTION_DB_ID")
     if not db_id:
         raise RuntimeError("Environment variable NOTION_DB_ID is required.")
 
+    # ------------------------------------------------------------------
+    # Normalise *created_after* ------------------------------------------------
+    # ------------------------------------------------------------------
+    ca_dt: datetime | None
+    if created_after is None:
+        ca_dt = None
+    elif isinstance(created_after, datetime):
+        ca_dt = created_after
+    elif isinstance(created_after, (int, float)):
+        # Treat the numeric value as a day-delta so that ``created_after=120``
+        # translates to "within the last 120 days" – this aligns with the
+        # intuitive expectation for larger integers and keeps the behaviour
+        # consistent across both absolute and relative forms.
+        ca_dt = datetime.now(timezone.utc) - timedelta(days=float(created_after))
+    elif isinstance(created_after, timedelta):
+        ca_dt = datetime.now(timezone.utc) - created_after
+    else:  # pragma: no cover – defensive guard for unexpected types
+        raise TypeError(
+            "'created_after' must be datetime, int, float, timedelta or None. "
+            f"Got {type(created_after).__name__} instead."
+        )
+
     _logger.info(
-        "action=poll.start db_id=%s since=%s created_after=%s",
+        "action=poll.start db_id=%s last_updated=%s created_after=%s",
         db_id,
-        since.isoformat() if since else "None",
-        created_after.isoformat() if created_after else "None",
+        last_updated.isoformat() if last_updated else "None",
+        ca_dt.isoformat() if ca_dt else "None",
     )
 
     client = _build_client()
 
     # ------------------------------------------------------------------
     # Build the filter – only restrict by *created_time* to keep query fast.
-    # We'll apply the `since` cutoff on the DDQ child page after we detect
+    # We'll apply the `last_updated` cutoff on the DDQ child page after we detect
     # completion so that updates inside the questionnaire are respected.
     # ------------------------------------------------------------------
     and_filters: List[Dict[str, object]] = []
 
     # NOTE: We intentionally do *not* add a parent `last_edited_time` filter
-    # when `since` is provided, because ticking the final checkbox often
+    # when `last_updated` is provided, because ticking the final checkbox often
     # happens *inside* the DDQ sub-page and does **not** modify the parent
     # card.  We will instead filter later based on the DDQ page's own
     # `last_edited_time`.
 
-    if created_after is not None:
+    if ca_dt is not None:
         and_filters.append(
             {
                 "timestamp": "created_time",
-                "created_time": {"on_or_after": created_after.isoformat()},
+                "created_time": {"on_or_after": ca_dt.isoformat()},
             }
         )
 
@@ -288,104 +458,84 @@ def poll_notion_db(
         page_id: str = cast(str, page["id"])
 
         # ------------------------------------------------------------------
-        # Scan the "Due Diligence" child page for completion marker
+        # Scan all "Due Diligence" child pages for a *completed* questionnaire
         # ------------------------------------------------------------------
         blocks = _list_blocks(client, page_id)
-        ddq_block = next(
-            (
-                b
-                for b in blocks
-                if b.get("type") == "child_page"
-                and b["child_page"]["title"].lower().startswith("due diligence")
-            ),
-            None,
-        )
+        ddq_candidates = [
+            b
+            for b in blocks
+            if b.get("type") == "child_page"
+            and "due diligence" in b["child_page"]["title"].lower()
+        ]
 
-        if not ddq_block:
-            continue  # No questionnaire sub-page
+        if not ddq_candidates:
+            continue  # No questionnaire sub-page at all
 
-        # Incrementally fetch blocks so we can bail once completion marker is found.
-        completed = False
-        ddq_cursor: str | None = None
-        while True:
-            blk_kwargs: Dict[str, object] = {
-                "block_id": cast(str, ddq_block["id"]),
-                "page_size": 100,
-            }
-            if ddq_cursor:
-                blk_kwargs["start_cursor"] = ddq_cursor
+        # --------------------------------------------------------------
+        # Evaluate *all* DDQ pages that are marked complete and remember
+        # the most recently edited one.  This covers the scenario where
+        # multiple questionnaires exist and only some are up-to-date.
+        # --------------------------------------------------------------
 
-            # Fetch next chunk of blocks with retry logic
-            retry = Retrying(
-                wait=wait_exponential(multiplier=0.5, min=0.5, max=2),
-                stop=stop_after_attempt(3),
-                retry=retry_if_exception(_is_retryable),
-                reraise=True,
-            )
+        ddq_last_edit_dt: datetime | None = None
+        completed_found = False
 
-            for attempt in retry:
-                with attempt:
-                    chunk = cast(
-                        Dict[str, object],
-                        client.blocks.children.list(**blk_kwargs),  # type: ignore[arg-type]
-                    )
+        for cand in ddq_candidates:
+            cand_id = cast(str, cand["id"])
 
-            ddq_chunk_blocks = cast(List[Dict[str, object]], chunk.get("results", []))
+            # Skip if the questionnaire is not completed
+            if not _ddq_is_completed(client, cand_id):
+                continue
 
-            # Check chunk for completion marker (iterate reversed so bottom-up)
-            for b in reversed(ddq_chunk_blocks):
-                if b.get("type") == "to_do":
-                    completed = bool(b["to_do"].get("checked", False))
-                    break
-                for kind in ("paragraph", "bulleted_list_item", "numbered_list_item"):
-                    if b.get("type") == kind:
-                        rich = b[kind].get("rich_text", [])
-                        text = "".join(t.get("plain_text", "") for t in rich)
-                        low = text.lower()
-                        if "[x]" in low:
-                            completed = True
-                            break
-                        if "[ ]" in low:
-                            completed = False
-                            break
-                if completed:
-                    break
+            completed_found = True
 
-            if completed or not chunk.get("has_more", False):
-                break
+            # -----------------------------
+            # Pull the accurate page-level ts
+            # -----------------------------
+            cand_dt = _page_last_edited_time(client, cand_id)
 
-            ddq_cursor = cast(str, chunk.get("next_cursor"))
+            # Fallback: compare with the block's own timestamp (sometimes newer)
+            blk_ts_raw: str | None = cast(str | None, cand.get("last_edited_time"))
+            if blk_ts_raw:
+                blk_dt = datetime.fromisoformat(blk_ts_raw.replace("Z", "+00:00")) if blk_ts_raw.endswith("Z") else datetime.fromisoformat(blk_ts_raw)
+                if cand_dt is None or blk_dt > cand_dt:
+                    cand_dt = blk_dt
 
-        if not completed:
-            continue  # Skip unfinished cards
+            # Keep the most recent among all completed DDQs
+            if cand_dt is not None and (ddq_last_edit_dt is None or cand_dt > ddq_last_edit_dt):
+                ddq_last_edit_dt = cand_dt
+
+        if not completed_found:
+            continue  # None of the questionnaires are finished – skip this card
 
         # ------------------------------------------------------------------
-        # Apply *since* cutoff based on the DDQ sub-page timestamp, not the
-        # parent card.  This ensures we catch pages whose final checkbox was
-        # ticked inside the questionnaire without touching the parent.
+        # Apply *last_updated* cutoff using the DDQ page timestamp (if available)
         # ------------------------------------------------------------------
-        if since is not None:
-            ddq_last_edit: str | None = ddq_block.get("last_edited_time")  # type: ignore[assignment]
-            if ddq_last_edit is not None:
-                # Convert ISO 8601 string (may end with 'Z') to datetime
-                if ddq_last_edit.endswith("Z"):
-                    ddq_last_edit_dt = datetime.fromisoformat(ddq_last_edit.replace("Z", "+00:00"))
-                else:
-                    ddq_last_edit_dt = datetime.fromisoformat(ddq_last_edit)
-
-                if ddq_last_edit_dt <= since:
-                    continue  # Completed before the cutoff – skip
+        if last_updated is not None and ddq_last_edit_dt is not None:
+            if ddq_last_edit_dt <= last_updated:
+                continue  # Completed before the cutoff – skip
 
         pages.append(
             {
                 "page_id": page_id,
                 "title": title,
                 # Track when the DDQ page itself was last edited (more accurate)
-                "updated_time": cast(str, ddq_block.get("last_edited_time", "")),
+                "updated_time": ddq_last_edit_dt.isoformat() if ddq_last_edit_dt else "",
             }
         )
 
     _logger.info("action=poll.success returned=%d", len(pages))
+
+    # ------------------------------------------------------------------
+    # Emit a follow-up line with the readable titles/IDs of the projects
+    # we detected so that operators can quickly confirm which cards were
+    # processed without having to cross-reference elsewhere.
+    # ------------------------------------------------------------------
+    if pages:
+        joined = ", ".join(f"{p['title']} ({p['page_id']})" for p in pages)
+        # Keep the key=value structure so that downstream log parsers retain
+        # compatibility while still exposing human-readable information.
+        _logger.info("action=poll.pages list=%s", joined)
 
     return pages
 

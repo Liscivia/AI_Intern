@@ -81,6 +81,23 @@ def _notion() -> NotionClient:
     timeout_cfg = httpx.Timeout(180.0, connect=10.0)
     return NotionClient(auth=token, client=httpx.Client(timeout=timeout_cfg))
 
+# ---------------------------------------------------------------------------
+# Helper – determine whether a given card already contains a published report
+# ---------------------------------------------------------------------------
+
+def _report_already_exists(page_id: str) -> bool:
+    """Return True if an *AI Deep Research Report* child page is present."""
+
+    client = _notion()
+    for attempt in _tenacity():
+        with attempt:
+            children = client.blocks.children.list(block_id=page_id, page_size=100)
+
+    for blk in children.get("results", []):
+        if blk.get("type") == "child_page" and blk["child_page"]["title"] == "AI Deep Research Report":
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # NEW: Markdown helpers – code & table
@@ -202,15 +219,30 @@ def _inline_md_to_rich_text(text: str) -> List[Dict[str, Any]]:
 
         if is_link:
             link_text, link_url = next_match.group(1), next_match.group(2)
-            parts.append(
-                {
-                    "type": "text",
-                    "text": {
-                        "content": _sanitize_text(link_text),
-                        "link": {"url": link_url},
-                    },
-                }
-            )
+            # Notion API requires fully-qualified URLs (http/https).  If the
+            # extracted URL does not look valid we fall back to plain text to
+            # avoid *Invalid URL for link* 400 errors.
+            if re.match(r"^https?://", link_url.strip()):
+                parts.append(
+                    {
+                        "type": "text",
+                        "text": {
+                            "content": _sanitize_text(link_text),
+                            "link": {"url": link_url},
+                        },
+                    }
+                )
+            else:
+                # Inline as plain text – preserve the label and the raw URL in
+                # parentheses so analysts still see the reference, just not
+                # as a clickable link that Notion would reject.
+                fallback = f"{link_text} ({link_url})".strip()
+                parts.append(
+                    {
+                        "type": "text",
+                        "text": {"content": _sanitize_text(fallback)},
+                    }
+                )
         else:
             bold_txt = next_match.group(1)
             parts.append(

@@ -250,9 +250,24 @@ async def deep_research(
     results = await asyncio.gather(*[process_query(query) for query in serp_queries])
 
     # Combine all results
-    all_learnings = list(
-        set(learning for result in results for learning in result["learnings"])
-    )
+    # Some LLM responses may return structured objects instead of plain strings
+    # for individual learnings (e.g. dicts with a `text` field).  Convert each
+    # element to a readable string first so we can safely deduplicate via a set
+    # without hitting *unhashable type: 'dict'* runtime errors.
+    normalized_learnings: List[str] = []
+    for result in results:
+        for learning in result["learnings"]:
+            if isinstance(learning, str):
+                normalized_learnings.append(learning.strip())
+            else:
+                # Fall back to JSON dump or simple str() to preserve info
+                try:
+                    import json as _json
+                    normalized_learnings.append(_json.dumps(learning, ensure_ascii=False))
+                except Exception:
+                    normalized_learnings.append(str(learning))
+
+    all_learnings = list(set(normalized_learnings))
 
     all_urls = list(set(url for result in results for url in result["visited_urls"]))
 
