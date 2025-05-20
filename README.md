@@ -16,10 +16,10 @@ All steps run entirely server-less – schedule `python main.py` on a cron / Git
 
 ```mermaid
 flowchart TD
-    A[watcher.py\npoll Notion DB] -->|Completed DDQ| B[research.py\ndeep-web research]
-    B --> C[writer.py\ncreate/overwrite report page]
-    C --> D[scorer.py\nLLM JSON scoring]
-    D --> E[pusher.py\nupdate 🔥 Ratings DB]
+    A[watcher.py\n poll Notion DB] -->|Completed DDQ| B[research.py\n deep-web research]
+    B --> C[writer.py\n create/overwrite report page]
+    C --> D[scorer.py\n LLM JSON scoring]
+    D --> E[pusher.py\n update 🔥 Ratings DB]
 ```
 
 Every module can be executed independently (useful during development) yet `main.py` stitches them together for weekly automation.
