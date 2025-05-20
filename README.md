@@ -73,18 +73,18 @@ Create the `.env` file, using the `.env.example` as reference:
 ```dotenv
 # Notion
 NOTION_TOKEN=secret_…
-NOTION_DB_ID=<database-id>
+NOTION_DB_ID=<database-id> # enable automation on the notion CRM itself 
 
 # LLM provider
 OPENAI_API_KEY=sk-…
-OPENAI_MODEL=gpt-4o-mini    # or any compatible model
+OPENAI_MODEL=gpt-4o-mini    # or any compatible model (deep-thinking & strong tool-calling capabilities recommended)
 
 # Web-scraping
 #   "firecrawl" (API-based) is default – set key or flip to Playwright fallback.
-FIRECRAWL_API_KEY=fc_…       # optional but recommended
+FIRECRAWL_API_KEY=fc_…       # recommended
 DEFAULT_SCRAPER=firecrawl    # or playwright_ddgs
 
-# Optional – Deep-research prompt overrides
+# Prompts
 DEEP_RESEARCH_PROMPT="You are…"
 ```
 
@@ -97,6 +97,9 @@ Or execute the full test that mirrors the cron job:
 pytest tests/test_final.py -q
 ```
 or execute any of the tests to check out the functioning of each components
+```bash
+pytest tests/test_watcher.py -v -s
+```
 
 ---
 
