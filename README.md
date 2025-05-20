@@ -1,105 +1,125 @@
-# Notion → AI → Google Sheets Automation Pipeline
+# Notion → AI Research Pipeline
 
-> End-to-end Python workflow that turns a **Completed** Due-Diligence Questionnaire (DDQ) in Notion into a fully-scored entry in our research Google Sheet – no servers, no databases, just APIs and scheduled jobs.
+Automates the full research workflow for crypto projects stored in a **Notion** CRM or Cards Database:
 
----
+1. Detect a card whose "Due-Diligence Questionnaire" (DDQ) child-page has been marked as **Completed**.
+2. Generate an in-depth Markdown report via the multi-step *Deep Research* agent (web scraping + LLM).
+3. Publish/overwrite a child page called **"AI Deep Research Report"** directly under the Notion card.
+4. Run an LLM-based scoring function to rate the project and save the JSON answers.
+5. Publish a 🔥 **Ratings** inline database with nested cards to relay project scores and Q&A, also for analysts to consult, chime in on Notion.
 
-## ✨ What you get
-
-| Step | Output |
-|------|--------|
-| 1. Watcher | Detects cards in a Notion CRM whose **Completed** checkbox flipped to ☑️ in DDQs |
-| 2. Deep Research | Institutional-grade Markdown "Deep" Research Report written by an LLM (define the depth of the web research in `src/research.py`)|
-| 3. Report Writer | Child page **"AI Deep Research Report"** created under the relative Notion card |
-| 4. Scoring Agent *(WIP)* | Strict JSON with 20+ scoring columns |
-| 5. Sheet Pusher *(WIP)* | Values & rationales filled into our Google Sheet |
-
-All activity is logged to `logs/` so the whole flow is fully auditable.
+All steps run entirely server-less – schedule `python main.py` on a cron / GitHub Actions and you are done.
 
 ---
 
-## 🗺️ Repository Layout
+## 🖼️ Pipeline Overview
 
-```text
+```mermaid
+flowchart TD
+    A[watcher.py\npoll Notion DB] -->|Completed DDQ| B[research.py\ndeep-web research]
+    B --> C[writer.py\ncreate/overwrite report page]
+    C --> D[scorer.py\nLLM JSON scoring]
+    D --> E[pusher.py\nupdate 🔥 Ratings DB]
+```
+
+Every module can be executed independently (useful during development) yet `main.py` stitches them together for weekly automation.
+
+---
+
+## 🗄️ Repo Layout
+
+```
 .
-├── src/                 # All runtime code
-│   ├── watcher.py       # 1️⃣ Poll Notion for completed DDQs
-│   ├── research.py      # 2️⃣ Deep-research wrapper around `deep-research-py`
-│   ├── writer.py        # 3️⃣ Convert Markdown → Notion blocks & publish
-│   ├── scorer.py        # 4️⃣ Score DDQ + report (TBD)
-│   └── pusher.py        # 5️⃣ Write scores to Google Sheets (TBD)
-├── main.py              # Orchestrator (weekly cron)
-├── requirements.txt     # Python deps
-└── tests/               # Pytest suite
+├── src/                # Runtime modules (watcher, research, writer, scorer, pusher)
+├── web_research/       # Deep-research agent & async search/scrape stack
+├── tests/              # Pytest suite covering the whole flow
+├── main.py             # Orchestrator (weekly cron job)
+├── requirements.txt    # Pinned dependencies
+└── README.md           # ← you are here
 ```
 
 ---
 
-## 🚀 Quick Start
+## ⚡ Quick Start
 
-1. **Clone & enter** the repo
-   ```bash
-   git clone https://github.com/Liscivia/AI_intern.git
-   cd AI_intern
-   ```
-2. **Create a virtual-env** (Python ≥3.11)
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   ```
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   playwright install  # only once, downloads browser binaries
-   ```
-4. **Configure secrets** – copy the template below into `.env` and fill the values:
-   ```bash
-   cp .env.example .env  # if the file exists; otherwise create it manually
-   ```
-   ```dotenv
-   # .env
-   NOTION_TOKEN=secret_xxxx
-   NOTION_DB_ID=xxx
-   OPENAI_API_KEY=sk-...
-   OPENAI_MODEL=o3
-   FIRECRAWL_KEY=fc_... # advised to utilize Firecrawl to prod
-   GOOGLE_SERVICE_JSON=/absolute/path/to/google-service.json
-   ```
-5. **Run the pipeline once** (with tests, until `main.py` is implemented):
+### 1. Clone & enter
+```bash
+git clone https://github.com/Liscivia/AI_intern.git
+cd AI_intern
+```
 
-   `pytest tests/test_multiple.py -rs -s` to produce all Deep Research Reports for all projects with completed DDQs within the previous week in the Notion db, and publish them in their cards.
-   `pytest tests/test_writer.py -rs -s` to produce a single Deep Research Report for the last completed DDQ in the Notion db and publish it on the card.
-   `tests/test_research.py -s` to produce a single Deep Research Report for the last completed DDQ in the Notion db and be able to read it in `reports/`
-   ...
+### 2. Create a virtual environment (Python 3.11)
+**Windows PowerShell**
+```powershell
+python -m venv ai_intern
+.\ai_intern\Scripts\Activate.ps1
+```
+**macOS / Linux**
+```bash
+python3 -m venv ai_intern
+source ai_intern/bin/activate
+```
+
+### 3. Install dependencies
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+# Playwright needs browser binaries once
+playwright install
+```
+
+### 4. Environment variables
+Create the `.env` file, using the `.env.example` as reference:
+```dotenv
+# Notion
+NOTION_TOKEN=secret_…
+NOTION_DB_ID=<database-id>
+
+# LLM provider
+OPENAI_API_KEY=sk-…
+OPENAI_MODEL=gpt-4o-mini    # or any compatible model
+
+# Web-scraping
+#   "firecrawl" (API-based) is default – set key or flip to Playwright fallback.
+FIRECRAWL_API_KEY=fc_…       # optional but recommended
+DEFAULT_SCRAPER=firecrawl    # or playwright_ddgs
+
+# Optional – Deep-research prompt overrides
+DEEP_RESEARCH_PROMPT="You are…"
+```
+
+### 5. Run the pipeline once
+```bash
+python main.py
+```
+Or execute the full test that mirrors the cron job:
+```bash
+pytest tests/test_final.py -q
+```
+or execute any of the tests to check out the functioning of each components
 
 ---
 
-## 🗓️ Scheduled Execution
+## 📝 Logs
 
-Add a weekly cron (or GitHub Actions, Cloud Run, etc.) that simply calls:
+File | Purpose
+---- | -------
+`logs/watcher.log` | Notion polling & pagination
+`logs/research.log` | Deep-research orchestration & web searches
+`logs/writer.log` | Markdown → Notion block conversion
+`logs/scorer.log` | LLM scoring lifecycle
 
----
-
-## 📜 Logging
-
-| File | Purpose |
-|------|---------|
-| `logs/watcher.log` | Notion polling (step 1) |
-| `logs/research.log` | Deep-research orchestration |
-| `logs/writer.log` | Markdown → Notion publishing |
-
-Each entry is a single `key=value` line so you can `grep` it easily.
+Each line is written in `key=value` format so you can grep/filter easily.
 
 ---
 
-## 🪄 Common Issues
+## 🪄 Troubleshooting
 
 | Symptom | Fix |
-|---------|-----|
-| `RuntimeError: Environment variable NOTION_TOKEN is required.` | Ensure `.env` is loaded (`source .venv/bin/activate` then `pip install python-dotenv` or export vars in your shell). |
-| Browser launch fails in CI | Use Playwright's `--browser chromium --with-deps` docker image or run `playwright install chromium` during build. |
-| `firecrawl` 429 errors | The library is set as default scraper; tune the rate-limit envs or switch to Playwright by un-commenting the fallback in `src/research.py`. |
+| ------- | --- |
+| `RuntimeError: Environment variable NOTION_TOKEN is required.` | Load/define all required vars (`NOTION_TOKEN`, `NOTION_DB_ID`, `OPENAI_API_KEY`). |
+| Firecrawl 429s / quota | Lower `RESEARCH_CONCURRENCY` env vars or set `DEFAULT_SCRAPER=playwright_ddgs`. |
 
----
+
 
 
